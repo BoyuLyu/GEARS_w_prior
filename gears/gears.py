@@ -19,6 +19,7 @@ torch.manual_seed(0)
 
 import warnings
 warnings.filterwarnings("ignore")
+import time
 
 class GEARS:
     """
@@ -523,9 +524,11 @@ class GEARS:
 
         for epoch in range(epochs):
             # Set epoch for DistributedSampler (important for shuffling)
+            start_time = time.time()
             if self.is_distributed and hasattr(train_loader, 'sampler'):
                 train_loader.sampler.set_epoch(epoch)
-            
+            end_time = time.time()
+            print_sys(f"Epoch {epoch+1} - Sampler set epoch time: {end_time - start_time:.2f} seconds")
             self.model.train()
 
             # Disable tqdm for non-zero ranks in distributed training
@@ -554,43 +557,44 @@ class GEARS:
                 if self.wandb and (not self.is_distributed or self.rank == 0):
                     self.wandb.log({'training_loss': loss.item()})
 
-                if step % 50 == 0 and (not self.is_distributed or self.rank == 0):
+                if step % 500 == 0 and (not self.is_distributed or self.rank == 0):
                     log = "Epoch {} Step {} Train Loss: {:.4f}" 
                     print_sys(log.format(epoch + 1, step + 1, loss.item()))
 
             scheduler.step()
             # Evaluate model performance on train and val set
-            train_res = evaluate(train_loader, self.model,
-                                 self.config['uncertainty'], self.device)
-            val_res = evaluate(val_loader, self.model,
-                                 self.config['uncertainty'], self.device)
-            train_metrics, _ = compute_metrics(train_res)
-            val_metrics, _ = compute_metrics(val_res)
+            if epoch % 5 == 0:
+                train_res = evaluate(train_loader, self.model,
+                                    self.config['uncertainty'], self.device)
+                val_res = evaluate(val_loader, self.model,
+                                    self.config['uncertainty'], self.device)
+                train_metrics, _ = compute_metrics(train_res)
+                val_metrics, _ = compute_metrics(val_res)
 
-            # Print epoch performance (only from rank 0)
-            if not self.is_distributed or self.rank == 0:
-                log = "Epoch {}: Train Overall MSE: {:.4f} " \
-                      "Validation Overall MSE: {:.4f}. "
-                print_sys(log.format(epoch + 1, train_metrics['mse'], 
-                                 val_metrics['mse']))
+                # Print epoch performance (only from rank 0)
+                if not self.is_distributed or self.rank == 0:
+                    log = "Epoch {}: Train Overall MSE: {:.4f} " \
+                        "Validation Overall MSE: {:.4f}. "
+                    print_sys(log.format(epoch + 1, train_metrics['mse'], 
+                                    val_metrics['mse']))
+                    
+                    # Print epoch performance for DE genes
+                    log = "Train Top 20 DE MSE: {:.4f} " \
+                        "Validation Top 20 DE MSE: {:.4f}. "
+                    print_sys(log.format(train_metrics['mse_de'],
+                                    val_metrics['mse_de']))
                 
-                # Print epoch performance for DE genes
-                log = "Train Top 20 DE MSE: {:.4f} " \
-                      "Validation Top 20 DE MSE: {:.4f}. "
-                print_sys(log.format(train_metrics['mse_de'],
-                                 val_metrics['mse_de']))
-            
-            if self.wandb and (not self.is_distributed or self.rank == 0):
-                metrics = ['mse', 'pearson']
-                for m in metrics:
-                    self.wandb.log({'train_' + m: train_metrics[m],
-                               'val_'+m: val_metrics[m],
-                               'train_de_' + m: train_metrics[m + '_de'],
-                               'val_de_'+m: val_metrics[m + '_de']})
-               
-            if val_metrics['mse_de'] < min_val:
-                min_val = val_metrics['mse_de']
-                best_model = deepcopy(self.model)
+                if self.wandb and (not self.is_distributed or self.rank == 0):
+                    metrics = ['mse', 'pearson']
+                    for m in metrics:
+                        self.wandb.log({'train_' + m: train_metrics[m],
+                                'val_'+m: val_metrics[m],
+                                'train_de_' + m: train_metrics[m + '_de'],
+                                'val_de_'+m: val_metrics[m + '_de']})
+                
+                if val_metrics['mse_de'] < min_val:
+                    min_val = val_metrics['mse_de']
+                    best_model = deepcopy(self.model)
         
         if not self.is_distributed or self.rank == 0:
             print_sys("Done!")
