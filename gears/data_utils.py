@@ -171,6 +171,7 @@ class DataSplitter():
             train, val, val_subgroup = self.get_simulation_split_single(train,
                                                                   0.9,
                                                                   seed)
+            train.append('ctrl')
         elif self.split_type == 'no_test':
             train, val = self.get_split_list(unique_perts,
                                           test_size=val_size)      
@@ -181,6 +182,7 @@ class DataSplitter():
                                           test_size=test_size)
             
             train, val = self.get_split_list(train, test_size=val_size)
+            train.append('ctrl')
 
         map_dict = {x: 'train' for x in train}
         map_dict.update({x: 'val' for x in val})

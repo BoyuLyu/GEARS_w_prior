@@ -14,7 +14,7 @@ from .utils import loss_fct, uncertainty_loss_fct, parse_any_pert, \
                   get_similarity_network, print_sys, GeneSimNetwork, \
                   create_cell_graph_dataset_for_prediction, get_mean_control, \
                   get_GI_genes_idx, get_GI_params
-
+from tqdm import tqdm
 torch.manual_seed(0)
 
 import warnings
@@ -82,6 +82,11 @@ class GEARS:
         self.default_pert_graph = pert_data.default_pert_graph
         self.saved_pred = {}
         self.saved_logvar_sum = {}
+        
+        # Distributed training attributes
+        self.is_distributed = False
+        self.rank = 0
+        self.world_size = 1
         
         self.ctrl_expression = torch.tensor(
             np.mean(self.adata.X[(self.adata.obs.condition == 'ctrl').to_numpy()],
@@ -294,8 +299,13 @@ class GEARS:
         
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump(self.config, f)
-       
-        torch.save(self.best_model.state_dict(), os.path.join(path, 'model.pt'))
+        
+        # Handle DistributedDataParallel wrapper
+        model_to_save = self.best_model
+        if isinstance(self.best_model, nn.parallel.DistributedDataParallel):
+            model_to_save = self.best_model.module
+        
+        torch.save(model_to_save.state_dict(), os.path.join(path, 'model.pt'))
     
     def predict(self, pert_list):
         """
@@ -506,12 +516,21 @@ class GEARS:
         scheduler = StepLR(optimizer, step_size=1, gamma=0.5)
 
         min_val = np.inf
-        print_sys('Start Training...')
+        
+        # Only print from rank 0 in distributed training
+        if not self.is_distributed or self.rank == 0:
+            print_sys('Start Training...')
 
         for epoch in range(epochs):
+            # Set epoch for DistributedSampler (important for shuffling)
+            if self.is_distributed and hasattr(train_loader, 'sampler'):
+                train_loader.sampler.set_epoch(epoch)
+            
             self.model.train()
 
-            for step, batch in enumerate(train_loader):
+            # Disable tqdm for non-zero ranks in distributed training
+            disable_tqdm = self.is_distributed and self.rank != 0
+            for step, batch in enumerate(tqdm(train_loader, disable=disable_tqdm)):
                 batch.to(self.device)
                 optimizer.zero_grad()
                 y = batch.y
@@ -532,10 +551,10 @@ class GEARS:
                 nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1.0)
                 optimizer.step()
 
-                if self.wandb:
+                if self.wandb and (not self.is_distributed or self.rank == 0):
                     self.wandb.log({'training_loss': loss.item()})
 
-                if step % 50 == 0:
+                if step % 50 == 0 and (not self.is_distributed or self.rank == 0):
                     log = "Epoch {} Step {} Train Loss: {:.4f}" 
                     print_sys(log.format(epoch + 1, step + 1, loss.item()))
 
@@ -548,19 +567,20 @@ class GEARS:
             train_metrics, _ = compute_metrics(train_res)
             val_metrics, _ = compute_metrics(val_res)
 
-            # Print epoch performance
-            log = "Epoch {}: Train Overall MSE: {:.4f} " \
-                  "Validation Overall MSE: {:.4f}. "
-            print_sys(log.format(epoch + 1, train_metrics['mse'], 
-                             val_metrics['mse']))
+            # Print epoch performance (only from rank 0)
+            if not self.is_distributed or self.rank == 0:
+                log = "Epoch {}: Train Overall MSE: {:.4f} " \
+                      "Validation Overall MSE: {:.4f}. "
+                print_sys(log.format(epoch + 1, train_metrics['mse'], 
+                                 val_metrics['mse']))
+                
+                # Print epoch performance for DE genes
+                log = "Train Top 20 DE MSE: {:.4f} " \
+                      "Validation Top 20 DE MSE: {:.4f}. "
+                print_sys(log.format(train_metrics['mse_de'],
+                                 val_metrics['mse_de']))
             
-            # Print epoch performance for DE genes
-            log = "Train Top 20 DE MSE: {:.4f} " \
-                  "Validation Top 20 DE MSE: {:.4f}. "
-            print_sys(log.format(train_metrics['mse_de'],
-                             val_metrics['mse_de']))
-            
-            if self.wandb:
+            if self.wandb and (not self.is_distributed or self.rank == 0):
                 metrics = ['mse', 'pearson']
                 for m in metrics:
                     self.wandb.log({'train_' + m: train_metrics[m],
@@ -571,22 +591,30 @@ class GEARS:
             if val_metrics['mse_de'] < min_val:
                 min_val = val_metrics['mse_de']
                 best_model = deepcopy(self.model)
-                
-        print_sys("Done!")
+        
+        if not self.is_distributed or self.rank == 0:
+            print_sys("Done!")
+        
         self.best_model = best_model
 
         if 'test_loader' not in self.dataloader:
-            print_sys('Done! No test dataloader detected.')
+            if not self.is_distributed or self.rank == 0:
+                print_sys('Done! No test dataloader detected.')
             return
             
-        # Model testing
+        # Model testing (only evaluate on rank 0 or gather results from all ranks)
         test_loader = self.dataloader['test_loader']
-        print_sys("Start Testing...")
+        
+        if not self.is_distributed or self.rank == 0:
+            print_sys("Start Testing...")
+        
         test_res = evaluate(test_loader, self.best_model,
                             self.config['uncertainty'], self.device)
-        test_metrics, test_pert_res = compute_metrics(test_res)    
-        log = "Best performing model: Test Top 20 DE MSE: {:.4f}"
-        print_sys(log.format(test_metrics['mse_de']))
+        test_metrics, test_pert_res = compute_metrics(test_res)
+        
+        if not self.is_distributed or self.rank == 0:
+            log = "Best performing model: Test Top 20 DE MSE: {:.4f}"
+            print_sys(log.format(test_metrics['mse_de']))
         
         if self.wandb:
             metrics = ['mse', 'pearson']

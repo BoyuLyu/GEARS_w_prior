@@ -406,7 +406,7 @@ class PertData:
                 print_sys(i + ':' + str(len(j)))
         print_sys("Done!")
         
-    def get_dataloader(self, batch_size, test_batch_size = None):
+    def get_dataloader(self, batch_size, test_batch_size = None, num_workers=4):
         """
         Get dataloaders for training and testing
 
@@ -416,6 +416,8 @@ class PertData:
             Batch size for training
         test_batch_size: int
             Batch size for testing
+        num_workers: int
+            Number of worker processes for data loading (default: 4)
 
         Returns
         -------
@@ -441,7 +443,10 @@ class PertData:
             print_sys("Creating dataloaders....")
             # Set up dataloaders
             test_loader = DataLoader(cell_graphs['test'],
-                                batch_size=batch_size, shuffle=False)
+                                batch_size=batch_size, 
+                                shuffle=False,
+                                num_workers=num_workers,
+                                pin_memory=True)
 
             print_sys("Dataloaders created...")
             return {'test_loader': test_loader}
@@ -459,13 +464,23 @@ class PertData:
             
             # Set up dataloaders
             train_loader = DataLoader(cell_graphs['train'],
-                                batch_size=batch_size, shuffle=True, drop_last = True)
+                                batch_size=batch_size, 
+                                shuffle=True, 
+                                num_workers=num_workers,
+                                pin_memory=True,
+                                drop_last = True)
             val_loader = DataLoader(cell_graphs['val'],
-                                batch_size=batch_size, shuffle=True)
+                                batch_size=batch_size, 
+                                shuffle=True,
+                                num_workers=num_workers,
+                                pin_memory=True)
             
             if self.split !='no_test':
                 test_loader = DataLoader(cell_graphs['test'],
-                                batch_size=batch_size, shuffle=False)
+                                batch_size=batch_size, 
+                                shuffle=False,
+                                num_workers=num_workers,
+                                pin_memory=True)
                 self.dataloader =  {'train_loader': train_loader,
                                     'val_loader': val_loader,
                                     'test_loader': test_loader}
@@ -474,6 +489,136 @@ class PertData:
                 self.dataloader =  {'train_loader': train_loader,
                                     'val_loader': val_loader}
             print_sys("Done!")
+    
+    def get_dataloader_distributed(self, batch_size, test_batch_size=None, 
+                                   world_size=1, rank=0, num_workers=4):
+        """
+        Get distributed dataloaders for multi-GPU training
+        
+        Parameters
+        ----------
+        batch_size: int
+            Batch size per GPU for training
+        test_batch_size: int
+            Batch size per GPU for testing
+        world_size: int
+            Total number of GPUs/processes
+        rank: int
+            Current process rank
+        num_workers: int
+            Number of data loading workers per GPU
+            
+        Returns
+        -------
+        None (sets self.dataloader)
+        """
+        from torch.utils.data.distributed import DistributedSampler
+        
+        if test_batch_size is None:
+            test_batch_size = batch_size
+            
+        self.node_map = {x: it for it, x in enumerate(self.adata.var.gene_name)}
+        self.gene_names = self.adata.var.gene_name
+        
+        # Create cell graphs
+        cell_graphs = {}
+        
+        if self.split == 'no_split':
+            i = 'test'
+            cell_graphs[i] = []
+            for p in self.set2conditions[i]:
+                if p != 'ctrl':
+                    cell_graphs[i].extend(self.dataset_processed[p])
+            
+            # Test loader (no need for distributed sampler in test)
+            test_loader = DataLoader(
+                cell_graphs['test'],
+                batch_size=test_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True
+            )
+            
+            self.dataloader = {'test_loader': test_loader}
+            
+        else:
+            if self.split == 'no_test':
+                splits = ['train', 'val']
+            else:
+                splits = ['train', 'val', 'test']
+                
+            for i in splits:
+                cell_graphs[i] = []
+                for p in self.set2conditions[i]:
+                    cell_graphs[i].extend(self.dataset_processed[p])
+            
+            # Training loader with DistributedSampler
+            train_sampler = DistributedSampler(
+                cell_graphs['train'],
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True
+            )
+            
+            train_loader = DataLoader(
+                cell_graphs['train'],
+                batch_size=batch_size,
+                sampler=train_sampler,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=True
+            )
+            
+            # Validation loader with DistributedSampler
+            val_sampler = DistributedSampler(
+                cell_graphs['val'],
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+            
+            val_loader = DataLoader(
+                cell_graphs['val'],
+                batch_size=test_batch_size,
+                sampler=val_sampler,
+                num_workers=num_workers,
+                pin_memory=True
+            )
+            
+            if self.split != 'no_test':
+                # Test loader with DistributedSampler
+                test_sampler = DistributedSampler(
+                    cell_graphs['test'],
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False
+                )
+                
+                test_loader = DataLoader(
+                    cell_graphs['test'],
+                    batch_size=test_batch_size,
+                    sampler=test_sampler,
+                    num_workers=num_workers,
+                    pin_memory=True
+                )
+                
+                self.dataloader = {
+                    'train_loader': train_loader,
+                    'val_loader': val_loader,
+                    'test_loader': test_loader
+                }
+            else:
+                self.dataloader = {
+                    'train_loader': train_loader,
+                    'val_loader': val_loader
+                }
+        
+        if rank == 0:
+            print_sys("Distributed dataloaders created!")
+            print_sys(f"Training samples per GPU: ~{len(cell_graphs['train'])//world_size}")
+            if 'val' in cell_graphs:
+                print_sys(f"Validation samples per GPU: ~{len(cell_graphs['val'])//world_size}")
 
     def get_pert_idx(self, pert_category):
         """
