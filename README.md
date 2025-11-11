@@ -8,7 +8,7 @@ This repository hosts the official implementation of GEARS, a method that can pr
 
 ### Installation 
 
-Install [PyG](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html), and then do `pip install cell-gears`.
+Install [PyG](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html), and then go the folder and do `pip install -e .`.
 
 ### [New] Updates in v0.1.1
 
